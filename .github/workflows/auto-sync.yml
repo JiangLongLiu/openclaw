@@ -2,14 +2,14 @@ name: Auto Sync from Upstream
 
 on:
   schedule:
-    # 每周一 UTC 时间 2:00 运行（北京时间 10:00）
-    - cron: '0 2 * * 1'
+    # 每天 UTC 时间 18:00 运行（北京时间凌晨 2:00）
+    - cron: '0 18 * * *'
   
-  # 允许手动触发
+  # 允许手动触发测试
   workflow_dispatch:
 
 env:
-  # 上游仓库地址
+  # 上游仓库地址 (openclaw)
   UPSTREAM_REPO: https://github.com/JingMatrix/openclaw.git
   # 上游分支
   UPSTREAM_BRANCH: main
@@ -24,7 +24,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN || secrets.PAT_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
       
       - name: Configure Git
@@ -42,7 +42,7 @@ jobs:
       
       - name: Reset to upstream latest
         run: |
-          git reset --hard upstream/${{ env.UPSTREAM_BRANCH }}/
+          git reset --hard upstream/${{ env.UPSTREAM_BRANCH }}
       
       - name: Push to fork
         run: |
@@ -53,3 +53,15 @@ jobs:
       - name: Cleanup
         run: |
           git remote remove upstream || true
+      
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ 同步成功！上游仓库：${{ env.UPSTREAM_REPO }}"
+          echo "📅 同步时间：$(date)"
+      
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "❌ 同步失败！请检查上游仓库是否存在"
+          exit 1
