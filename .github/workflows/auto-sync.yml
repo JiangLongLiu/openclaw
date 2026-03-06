@@ -40,33 +40,56 @@ jobs:
         run: |
           git fetch upstream --tags --force
       
-      - name: Sync code (excluding .github directory)
+      - name: Get latest upstream commit
+        id: upstream
         run: |
-          # 获取上游分支的最新提交
-          git fetch origin +refs/heads/${{ env.TARGET_BRANCH }}:refs/remotes/origin/${{ env.TARGET_BRANCH }}
+          echo "commit=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})" >> $GITHUB_OUTPUT
+      
+      - name: Check if sync needed
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=${{ steps.upstream.outputs.commit }}
           
-          # 创建一个临时分支来保存你的 .github 配置
-          git checkout -b temp-save-github
-          git add -A
-          git commit -m "save github configs" || true
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "Already up to date"
+            echo "sync_needed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Sync needed: $LOCAL -> $UPSTREAM"
+            echo "sync_needed=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Sync code (preserving .github directory)
+        if: steps.check.outputs.sync_needed == 'true'
+        run: |
+          # 保存你的 .github 目录到临时位置
+          cp -r .github /tmp/github-config-backup
           
-          # 重置到上游
-          git reset --hard upstream/${{ env.UPSTREAM_BRANCH }}
+          # 获取所有上游文件列表（排除 .github）
+          git ls-tree -r --name-only upstream/${{ env.UPSTREAM_BRANCH }} | \
+            grep -v '^\.github/' | \
+            xargs git checkout upstream/${{ env.UPSTREAM_BRANCH }} --
           
-          # 删除 .github 目录（用你保存的替换）
-          rm -rf .github
+          # 删除所有不在上游的文件（除了 .github）
+          git clean -fdx --exclude='.github/'
           
           # 恢复你的 .github 配置
-          git checkout temp-save-github -- .github/ || true
+          rm -rf .github
+          cp -r /tmp/github-config-backup .github
           
-          # 清理临时分支
-          git branch -D temp-save-github || true
-          
-          # 确保删除 labeler.yml（如果存在）
-          rm -f .github/labeler.yml
-          rm -f .github/workflows/labeler.yml
+          # 确保 auto-sync.yml 存在
+          if [ ! -f ".github/workflows/auto-sync.yml" ]; then
+            echo "Warning: auto-sync.yml is missing!"
+          fi
+      
+      - name: Commit changes
+        if: steps.check.outputs.sync_needed == 'true'
+        run: |
+          git add -A
+          git commit -m "chore: sync from upstream ${{ steps.upstream.outputs.commit }}" || echo "No changes to commit"
       
       - name: Push to fork
+        if: steps.check.outputs.sync_needed == 'true'
         run: |
           git push origin ${{ env.TARGET_BRANCH }} --force
         env:
@@ -75,15 +98,16 @@ jobs:
       - name: Cleanup
         run: |
           git remote remove upstream || true
+          rm -rf /tmp/github-config-backup || true
       
       - name: Notify success
         if: success()
         run: |
           echo "✅ 同步成功！上游仓库：${{ env.UPSTREAM_REPO }}"
           echo "📅 同步时间：$(date)"
+          echo "🔗 上游 commit: ${{ steps.upstream.outputs.commit }}"
       
-      - name: Notify failure
-        if: failure()
+      - name: Already up to date
+        if: steps.check.outputs.sync_needed == 'false'
         run: |
-          echo "❌ 同步失败！请检查上游仓库是否存在"
-          exit 1
+          echo "ℹ️  已经是最新版本，无需同步"
