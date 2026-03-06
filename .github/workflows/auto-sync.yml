@@ -40,9 +40,16 @@ jobs:
         run: |
           git fetch upstream --tags --force
       
-      - name: Reset to upstream latest
+      - name: Reset to upstream latest (excluding .github)
         run: |
+          # 先重置到上游
           git reset --hard upstream/${{ env.UPSTREAM_BRANCH }}
+          
+          # 恢复 .github 目录（保留你自己的配置）
+          git checkout HEAD -- .github/ || true
+          
+          # 删除上游的 labeler.yml（如果存在）
+          rm -f .github/labeler.yml || true
       
       - name: Push to fork
         run: |
