@@ -40,16 +40,31 @@ jobs:
         run: |
           git fetch upstream --tags --force
       
-      - name: Reset to upstream latest (excluding .github)
+      - name: Sync code (excluding .github directory)
         run: |
-          # 先重置到上游
+          # 获取上游分支的最新提交
+          git fetch origin +refs/heads/${{ env.TARGET_BRANCH }}:refs/remotes/origin/${{ env.TARGET_BRANCH }}
+          
+          # 创建一个临时分支来保存你的 .github 配置
+          git checkout -b temp-save-github
+          git add -A
+          git commit -m "save github configs" || true
+          
+          # 重置到上游
           git reset --hard upstream/${{ env.UPSTREAM_BRANCH }}
           
-          # 恢复 .github 目录（保留你自己的配置）
-          git checkout HEAD -- .github/ || true
+          # 删除 .github 目录（用你保存的替换）
+          rm -rf .github
           
-          # 删除上游的 labeler.yml（如果存在）
-          rm -f .github/labeler.yml || true
+          # 恢复你的 .github 配置
+          git checkout temp-save-github -- .github/ || true
+          
+          # 清理临时分支
+          git branch -D temp-save-github || true
+          
+          # 确保删除 labeler.yml（如果存在）
+          rm -f .github/labeler.yml
+          rm -f .github/workflows/labeler.yml
       
       - name: Push to fork
         run: |
