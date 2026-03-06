@@ -10,7 +10,7 @@ on:
 
 env:
   # 上游仓库地址 (openclaw)
-  UPSTREAM_REPO: https://github.com/JingMatrix/openclaw.git
+  UPSTREAM_REPO: https://github.com/openclaw/openclaw.git
   # 上游分支
   UPSTREAM_BRANCH: main
   # 目标分支
