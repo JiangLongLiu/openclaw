@@ -3,6 +3,11 @@ import type { SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import {
+  requiresOpenAiCompatibleAnthropicToolPayload,
+  usesOpenAiFunctionAnthropicToolSchema,
+  usesOpenAiStringModeAnthropicToolChoice,
+} from "../provider-capabilities.js";
 import { log } from "./logger.js";
 
 const OPENROUTER_APP_HEADERS: Record<string, string> = {
@@ -49,7 +54,18 @@ export function resolveExtraParams(params: {
     return undefined;
   }
 
-  return Object.assign({}, globalParams, agentParams);
+  const merged = Object.assign({}, globalParams, agentParams);
+  const resolvedParallelToolCalls = resolveAliasedParamValue(
+    [globalParams, agentParams],
+    "parallel_tool_calls",
+    "parallelToolCalls",
+  );
+  if (resolvedParallelToolCalls !== undefined) {
+    merged.parallel_tool_calls = resolvedParallelToolCalls;
+    delete merged.parallelToolCalls;
+  }
+
+  return merged;
 }
 
 type CacheRetention = "none" | "short" | "long";
@@ -297,6 +313,42 @@ function shouldEnableOpenAIResponsesServerCompaction(
   return model.provider === "openai";
 }
 
+function shouldStripResponsesStore(
+  model: { api?: unknown; compat?: { supportsStore?: boolean } },
+  forceStore: boolean,
+): boolean {
+  if (forceStore) {
+    return false;
+  }
+  if (typeof model.api !== "string") {
+    return false;
+  }
+  return OPENAI_RESPONSES_APIS.has(model.api) && model.compat?.supportsStore === false;
+}
+
+function applyOpenAIResponsesPayloadOverrides(params: {
+  payloadObj: Record<string, unknown>;
+  forceStore: boolean;
+  stripStore: boolean;
+  useServerCompaction: boolean;
+  compactThreshold: number;
+}): void {
+  if (params.forceStore) {
+    params.payloadObj.store = true;
+  }
+  if (params.stripStore) {
+    delete params.payloadObj.store;
+  }
+  if (params.useServerCompaction && params.payloadObj.context_management === undefined) {
+    params.payloadObj.context_management = [
+      {
+        type: "compaction",
+        compact_threshold: params.compactThreshold,
+      },
+    ];
+  }
+}
+
 function createOpenAIResponsesContextManagementWrapper(
   baseStreamFn: StreamFn | undefined,
   extraParams: Record<string, unknown> | undefined,
@@ -305,7 +357,11 @@ function createOpenAIResponsesContextManagementWrapper(
   return (model, context, options) => {
     const forceStore = shouldForceResponsesStore(model);
     const useServerCompaction = shouldEnableOpenAIResponsesServerCompaction(model, extraParams);
-    if (!forceStore && !useServerCompaction) {
+    // Strip `store` from the payload when the model declares supportsStore=false.
+    // pi-ai upstream hardcodes `store: false` for Responses API; strict
+    // OpenAI-compatible endpoints (e.g. Gemini via Cloudflare) reject it.
+    const stripStore = shouldStripResponsesStore(model, forceStore);
+    if (!forceStore && !useServerCompaction && !stripStore) {
       return underlying(model, context, options);
     }
 
@@ -317,18 +373,13 @@ function createOpenAIResponsesContextManagementWrapper(
       ...options,
       onPayload: (payload) => {
         if (payload && typeof payload === "object") {
-          const payloadObj = payload as Record<string, unknown>;
-          if (forceStore) {
-            payloadObj.store = true;
-          }
-          if (useServerCompaction && payloadObj.context_management === undefined) {
-            payloadObj.context_management = [
-              {
-                type: "compaction",
-                compact_threshold: compactThreshold,
-              },
-            ];
-          }
+          applyOpenAIResponsesPayloadOverrides({
+            payloadObj: payload as Record<string, unknown>,
+            forceStore,
+            stripStore,
+            useServerCompaction,
+            compactThreshold,
+          });
         }
         originalOnPayload?.(payload);
       },
@@ -740,7 +791,7 @@ function createMoonshotThinkingWrapper(
   };
 }
 
-function isKimiCodingAnthropicEndpoint(model: {
+function requiresAnthropicToolPayloadCompatibilityForModel(model: {
   api?: unknown;
   provider?: unknown;
   baseUrl?: unknown;
@@ -749,7 +800,10 @@ function isKimiCodingAnthropicEndpoint(model: {
     return false;
   }
 
-  if (typeof model.provider === "string" && model.provider.trim().toLowerCase() === "kimi-coding") {
+  if (
+    typeof model.provider === "string" &&
+    requiresOpenAiCompatibleAnthropicToolPayload(model.provider)
+  ) {
     return true;
   }
 
@@ -768,7 +822,9 @@ function isKimiCodingAnthropicEndpoint(model: {
   }
 }
 
-function normalizeKimiCodingToolDefinition(tool: unknown): Record<string, unknown> | undefined {
+function normalizeOpenAiFunctionAnthropicToolDefinition(
+  tool: unknown,
+): Record<string, unknown> | undefined {
   if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
     return undefined;
   }
@@ -806,12 +862,21 @@ function normalizeKimiCodingToolDefinition(tool: unknown): Record<string, unknow
   };
 }
 
-function normalizeKimiCodingToolChoice(toolChoice: unknown): unknown {
+function normalizeOpenAiStringModeAnthropicToolChoice(toolChoice: unknown): unknown {
   if (!toolChoice || typeof toolChoice !== "object" || Array.isArray(toolChoice)) {
     return toolChoice;
   }
 
   const choice = toolChoice as Record<string, unknown>;
+  if (choice.type === "auto") {
+    return "auto";
+  }
+  if (choice.type === "none") {
+    return "none";
+  }
+  if (choice.type === "required") {
+    return "required";
+  }
   if (choice.type === "any") {
     return "required";
   }
@@ -826,24 +891,35 @@ function normalizeKimiCodingToolChoice(toolChoice: unknown): unknown {
 }
 
 /**
- * Kimi Coding's anthropic-messages endpoint expects OpenAI-style tool payloads
- * (`tools[].function`) even when messages use Anthropic request framing.
+ * Some anthropic-messages providers accept Anthropic framing but still expect
+ * OpenAI-style tool payloads (`tools[].function`, string tool_choice modes).
  */
-function createKimiCodingAnthropicToolSchemaWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+function createAnthropicToolPayloadCompatibilityWrapper(
+  baseStreamFn: StreamFn | undefined,
+): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
     const originalOnPayload = options?.onPayload;
     return underlying(model, context, {
       ...options,
       onPayload: (payload) => {
-        if (payload && typeof payload === "object" && isKimiCodingAnthropicEndpoint(model)) {
+        const provider = typeof model.provider === "string" ? model.provider : undefined;
+        if (
+          payload &&
+          typeof payload === "object" &&
+          requiresAnthropicToolPayloadCompatibilityForModel(model)
+        ) {
           const payloadObj = payload as Record<string, unknown>;
-          if (Array.isArray(payloadObj.tools)) {
+          if (Array.isArray(payloadObj.tools) && usesOpenAiFunctionAnthropicToolSchema(provider)) {
             payloadObj.tools = payloadObj.tools
-              .map((tool) => normalizeKimiCodingToolDefinition(tool))
+              .map((tool) => normalizeOpenAiFunctionAnthropicToolDefinition(tool))
               .filter((tool): tool is Record<string, unknown> => !!tool);
           }
-          payloadObj.tool_choice = normalizeKimiCodingToolChoice(payloadObj.tool_choice);
+          if (usesOpenAiStringModeAnthropicToolChoice(provider)) {
+            payloadObj.tool_choice = normalizeOpenAiStringModeAnthropicToolChoice(
+              payloadObj.tool_choice,
+            );
+          }
         }
         originalOnPayload?.(payload);
       },
@@ -1073,6 +1149,53 @@ function createZaiToolStreamWrapper(
   };
 }
 
+function resolveAliasedParamValue(
+  sources: Array<Record<string, unknown> | undefined>,
+  snakeCaseKey: string,
+  camelCaseKey: string,
+): unknown {
+  let resolved: unknown = undefined;
+  let seen = false;
+  for (const source of sources) {
+    if (!source) {
+      continue;
+    }
+    const hasSnakeCaseKey = Object.hasOwn(source, snakeCaseKey);
+    const hasCamelCaseKey = Object.hasOwn(source, camelCaseKey);
+    if (!hasSnakeCaseKey && !hasCamelCaseKey) {
+      continue;
+    }
+    resolved = hasSnakeCaseKey ? source[snakeCaseKey] : source[camelCaseKey];
+    seen = true;
+  }
+  return seen ? resolved : undefined;
+}
+
+function createParallelToolCallsWrapper(
+  baseStreamFn: StreamFn | undefined,
+  enabled: boolean,
+): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) => {
+    if (model.api !== "openai-completions" && model.api !== "openai-responses") {
+      return underlying(model, context, options);
+    }
+    log.debug(
+      `applying parallel_tool_calls=${enabled} for ${model.provider ?? "unknown"}/${model.id ?? "unknown"} api=${model.api}`,
+    );
+    const originalOnPayload = options?.onPayload;
+    return underlying(model, context, {
+      ...options,
+      onPayload: (payload) => {
+        if (payload && typeof payload === "object") {
+          (payload as Record<string, unknown>).parallel_tool_calls = enabled;
+        }
+        originalOnPayload?.(payload);
+      },
+    });
+  };
+}
+
 /**
  * Apply extra params (like temperature) to an agent's streamFn.
  * Also adds OpenRouter app attribution headers when using the OpenRouter provider.
@@ -1088,7 +1211,7 @@ export function applyExtraParamsToAgent(
   thinkingLevel?: ThinkLevel,
   agentId?: string,
 ): void {
-  const extraParams = resolveExtraParams({
+  const resolvedExtraParams = resolveExtraParams({
     cfg,
     provider,
     modelId,
@@ -1107,7 +1230,7 @@ export function applyExtraParamsToAgent(
           Object.entries(extraParamsOverride).filter(([, value]) => value !== undefined),
         )
       : undefined;
-  const merged = Object.assign({}, extraParams, override);
+  const merged = Object.assign({}, resolvedExtraParams, override);
   const wrappedStreamFn = createStreamFnWithExtraParams(agent.streamFn, merged, provider);
 
   if (wrappedStreamFn) {
@@ -1143,7 +1266,7 @@ export function applyExtraParamsToAgent(
     agent.streamFn = createMoonshotThinkingWrapper(agent.streamFn, moonshotThinkingType);
   }
 
-  agent.streamFn = createKimiCodingAnthropicToolSchemaWrapper(agent.streamFn);
+  agent.streamFn = createAnthropicToolPayloadCompatibilityWrapper(agent.streamFn);
 
   if (provider === "openrouter") {
     log.debug(`applying OpenRouter app attribution headers for ${provider}/${modelId}`);
@@ -1203,4 +1326,23 @@ export function applyExtraParamsToAgent(
   // Force `store=true` for direct OpenAI Responses models and auto-enable
   // server-side compaction for compatible OpenAI Responses payloads.
   agent.streamFn = createOpenAIResponsesContextManagementWrapper(agent.streamFn, merged);
+
+  const rawParallelToolCalls = resolveAliasedParamValue(
+    [resolvedExtraParams, override],
+    "parallel_tool_calls",
+    "parallelToolCalls",
+  );
+  if (rawParallelToolCalls !== undefined) {
+    if (typeof rawParallelToolCalls === "boolean") {
+      agent.streamFn = createParallelToolCallsWrapper(agent.streamFn, rawParallelToolCalls);
+    } else if (rawParallelToolCalls === null) {
+      log.debug("parallel_tool_calls suppressed by null override, skipping injection");
+    } else {
+      const summary =
+        typeof rawParallelToolCalls === "string"
+          ? rawParallelToolCalls
+          : typeof rawParallelToolCalls;
+      log.warn(`ignoring invalid parallel_tool_calls param: ${summary}`);
+    }
+  }
 }
