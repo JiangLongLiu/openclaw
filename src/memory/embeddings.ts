@@ -4,6 +4,8 @@ import type { OpenClawConfig } from "../config/config.js";
 import type { SecretInput } from "../config/types.secrets.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { resolveUserPath } from "../utils.js";
+import type { EmbeddingInput } from "./embedding-inputs.js";
+import { sanitizeAndNormalizeEmbedding } from "./embedding-vectors.js";
 import {
   createGeminiEmbeddingProvider,
   type GeminiEmbeddingClient,
@@ -18,15 +20,6 @@ import { createOpenAiEmbeddingProvider, type OpenAiEmbeddingClient } from "./emb
 import { createVoyageEmbeddingProvider, type VoyageEmbeddingClient } from "./embeddings-voyage.js";
 import { importNodeLlamaCpp } from "./node-llama.js";
 
-function sanitizeAndNormalizeEmbedding(vec: number[]): number[] {
-  const sanitized = vec.map((value) => (Number.isFinite(value) ? value : 0));
-  const magnitude = Math.sqrt(sanitized.reduce((sum, value) => sum + value * value, 0));
-  if (magnitude < 1e-10) {
-    return sanitized;
-  }
-  return sanitized.map((value) => value / magnitude);
-}
-
 export type { GeminiEmbeddingClient } from "./embeddings-gemini.js";
 export type { MistralEmbeddingClient } from "./embeddings-mistral.js";
 export type { OpenAiEmbeddingClient } from "./embeddings-openai.js";
@@ -39,6 +32,7 @@ export type EmbeddingProvider = {
   maxInputTokens?: number;
   embedQuery: (text: string) => Promise<number[]>;
   embedBatch: (texts: string[]) => Promise<number[][]>;
+  embedBatchInputs?: (inputs: EmbeddingInput[]) => Promise<number[][]>;
 };
 
 export type EmbeddingProviderId = "openai" | "local" | "gemini" | "voyage" | "mistral" | "ollama";
@@ -316,7 +310,7 @@ function formatLocalSetupError(err: unknown): string {
         : undefined,
     missing && detail ? `Detail: ${detail}` : null,
     "To enable local embeddings:",
-    "1) Use Node 22 LTS (recommended for installs/updates)",
+    "1) Use Node 24 (recommended for installs/updates; Node 22 LTS, currently 22.16+, remains supported)",
     missing
       ? "2) Reinstall OpenClaw (this should install node-llama-cpp): npm i -g openclaw@latest"
       : null,
